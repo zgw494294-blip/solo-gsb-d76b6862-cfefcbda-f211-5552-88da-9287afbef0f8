@@ -10,6 +10,8 @@
   <header>
     <h1>🎭 舞台提示执行台</h1>
     <div class="header-ops">
+      <a class="screen-bar-link" href="/screen" target="_blank" rel="noopener"
+        title="另开观众字幕屏：只显示另行设置并随发出上屏的字幕，不显示后台提示正文">🖥 观众字幕屏</a>
       <span id="control-badge" class="control-badge off" title="单控制席：启用后仅持有凭据的页面可写，其余页面只读、可接管">控制席：…</span>
       <button id="control-btn" class="ghost hidden"></button>
       <button id="archives-btn" class="ghost">📚 档案库</button>
@@ -48,6 +50,14 @@
         <button id="archive-btn" class="warning-outline">归档本场 🗂</button>
         <button id="reset-btn" class="danger-outline">重新开始</button>
       </span>
+    </div>
+
+    <!-- 观众字幕屏当前画面（执行台监看）：字幕与画面在服务端随发出同事务更新 -->
+    <div id="screen-bar" class="screen-blank">
+      <span class="screen-bar-label">观众字幕屏</span>
+      <span id="screen-bar-text" class="screen-bar-text">清屏中（无字幕）</span>
+      <span id="screen-bar-seq" class="screen-bar-seq">画面 #0</span>
+      <a class="screen-bar-link" href="/screen" target="_blank" rel="noopener">打开字幕屏 ↗</a>
     </div>
 
     <div class="columns">

@@ -565,3 +565,109 @@ button.small { padding: 3px 10px; font-size: 12px; }
   .compare-row > .badge { grid-column: 1 / -1; justify-self: start; }
   .compare-delta-cell { grid-column: 1 / -1; }
 }
+
+/* ---------- 观众字幕屏（/screen 独立页） ---------- */
+.screen-body {
+  margin: 0;
+  min-height: 100vh;
+  background: #000;
+  overflow: hidden;
+}
+.screen-stage {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end; /* 字幕贴近画面下沿 */
+  padding: 6vh 6vw 12vh;
+}
+.screen-text {
+  color: #fff;
+  font-size: clamp(34px, 5.2vw, 88px);
+  font-weight: 700;
+  line-height: 1.45;
+  text-align: center;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-shadow:
+    0 2px 8px rgba(0, 0, 0, .9),
+    0 0 24px rgba(0, 0, 0, .7);
+}
+.screen-text:empty::after { content: ""; }
+.screen-conn {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 13px;
+  color: rgba(255, 255, 255, .55);
+  letter-spacing: .05em;
+  min-height: 18px;
+}
+.screen-conn.offline { color: rgba(255, 170, 170, .85); }
+
+/* ---------- 执行台：观众画面状态条 ---------- */
+#screen-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 14px;
+  margin-bottom: 14px;
+  font-size: 13px;
+}
+#screen-bar .screen-bar-label {
+  flex: none;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: .08em;
+}
+#screen-bar .screen-bar-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 600;
+}
+#screen-bar.screen-blank .screen-bar-text { color: var(--muted); font-weight: 400; }
+#screen-bar .screen-bar-seq {
+  flex: none;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+#screen-bar .screen-bar-link {
+  flex: none;
+  color: var(--accent);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 12px;
+  font-size: 12px;
+}
+#screen-bar .screen-bar-link:hover { border-color: var(--accent); }
+
+/* 待发提示上的字幕设置 / 失效标记 */
+.tag.sub-on { background: rgba(76,195,138,.15); color: var(--green); border: 1px solid var(--green); }
+.tag.sub-off { background: rgba(229,99,111,.12); color: var(--red); border: 1px solid var(--red); }
+.sub-invalid-note { color: var(--red); }
+
+/* 待发列表中的字幕设置表单 */
+.subtitle-edit {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--green);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.subtitle-edit .ops { margin-left: auto; }
+.subtitle-edit .subtitle-input { flex: 1 1 100%; order: 3; }
+.subtitle-edit .issue-meta { flex: 1 1 100%; order: 4; margin: 2px 0 0; }

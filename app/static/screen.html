@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>观众字幕屏</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="screen-body">
+  <!-- 观众专用页：只显示执行台另行设置并随发出上屏的字幕，
+       不包含（也无法经本页接口获得）提示正文、编号、进度等任何后台信息。 -->
+  <main id="screen-stage" class="screen-stage">
+    <div id="screen-text" class="screen-text" aria-live="polite"></div>
+    <div id="screen-conn" class="screen-conn"></div>
+  </main>
+  <script src="screen.js"></script>
+</body>
+</html>

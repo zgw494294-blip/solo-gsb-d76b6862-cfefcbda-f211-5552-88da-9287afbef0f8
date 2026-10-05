@@ -73,6 +73,19 @@ control_granted 一律按本次凭据如实回报（凭据永不泄露），当�
 手工/自动发出交错时，锁 + 版本 + 快照检查保证不重复处理、不覆盖已变内容、
 不留半次结果，写入失败整体不变。提议随数据库持久化（刷新、重启保留），
 归档、重置、开新场（手工录入或以档案开新场）一并清空，**不写入档案**。
+
+观众字幕屏：观众可打开独立页面 /screen（只读，经 GET /api/screen 轮询），
+画面只显示**另行设置的字幕**，不显示提示正文等任何后台信息；接口只返回
+当前字幕与跨场不归零的递增画面序号，迟到响应不能让画面倒退。执行台经
+POST /api/subtitles 为**演出中待发 cue_id** 设置字幕（携带 version、受
+控制席保护，文本去空白后 1～200 字符，null 清除；非法文本 400；非演出
+中 / 目标非待发 / 版本过期 409 附最新状态），设置与版本 +1 同事务保存，
+**不推进、不换核验轮次、不重新计时**，也不改变当前画面。字幕绑定提示
+身份：手工编辑或接受提议改写该提示（即使同文）即令字幕失效，重排不
+影响；手工或自动发出时有效字幕替换观众画面、否则清屏，画面与发出同
+事务保存，失败均不变、不额外阻挡发出。撤回清屏但保留设置；归档、重置、
+开新场（手工录入或以档案开新场）清屏并清除设置，字幕不进档案。设置与
+画面随数据库持久化（重启保留，旧库迁移默认无设置、画面为空、序号 0）。
 """
 import json
 import os
@@ -85,7 +98,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -159,7 +172,9 @@ def init_db() -> None:
                 auto_enabled    INTEGER NOT NULL DEFAULT 0,  -- 是否开启自动发出
                 auto_interval   INTEGER NOT NULL DEFAULT 10, -- 统一间隔（秒，1～60）
                 auto_deadline   REAL,     -- 当前提示到期时刻（epoch 秒）；暂停/关闭为 NULL
-                auto_remaining  REAL      -- 暂停时冻结的剩余秒数；未暂停为 NULL
+                auto_remaining  REAL,     -- 暂停时冻结的剩余秒数；未暂停为 NULL
+                screen_text     TEXT,     -- 观众字幕屏当前画面（清屏为 NULL）
+                screen_seq      INTEGER NOT NULL DEFAULT 0  -- 画面序号：跨场递增、从不归零
             );
             CREATE TABLE IF NOT EXISTS cues (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +184,9 @@ def init_db() -> None:
                 status         TEXT NOT NULL DEFAULT 'pending',  -- pending | issued
                 issued_content TEXT,                    -- 发出那一刻的内容快照
                 issued_at      TEXT,
-                issued_seq     INTEGER                  -- 发出顺序
+                issued_seq     INTEGER,                 -- 发出顺序
+                subtitle       TEXT,                    -- 绑定该提示的观众字幕设置（未设为 NULL）
+                subtitle_valid INTEGER NOT NULL DEFAULT 0  -- 字幕设置是否仍有效（手工编辑/接受提议失效）
             );
             CREATE TABLE IF NOT EXISTS issues (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 同时即保存顺序
@@ -249,6 +266,21 @@ def init_db() -> None:
             conn.execute("ALTER TABLE meta ADD COLUMN auto_deadline REAL")
         if "auto_remaining" not in columns:
             conn.execute("ALTER TABLE meta ADD COLUMN auto_remaining REAL")
+        # 旧库升级：meta 表缺少观众画面列时补上：旧库默认清屏、画面序号从 0 起。
+        if "screen_text" not in columns:
+            conn.execute("ALTER TABLE meta ADD COLUMN screen_text TEXT")
+        if "screen_seq" not in columns:
+            conn.execute(
+                "ALTER TABLE meta ADD COLUMN screen_seq INTEGER NOT NULL DEFAULT 0"
+            )
+        # 旧库升级：cues 表缺少观众字幕列时补上：旧提示默认无字幕设置、无效。
+        cue_columns = {r["name"] for r in conn.execute("PRAGMA table_info(cues)")}
+        if "subtitle" not in cue_columns:
+            conn.execute("ALTER TABLE cues ADD COLUMN subtitle TEXT")
+        if "subtitle_valid" not in cue_columns:
+            conn.execute(
+                "ALTER TABLE cues ADD COLUMN subtitle_valid INTEGER NOT NULL DEFAULT 0"
+            )
         # 旧库升级：archives 表缺少 issues 列时补上，旧档案默认无问题记录。
         archive_columns = {
             r["name"] for r in conn.execute("PRAGMA table_info(archives)")
@@ -484,11 +516,22 @@ def clear_suggestions(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM suggestions")
 
 
+def clear_subtitles_and_screen(conn: sqlite3.Connection) -> None:
+    """归档 / 重置 / 开新场：清除全部字幕设置并清屏（不写入档案）。
+
+    与收场 / 开场写入同一事务：删除本场提示（DELETE FROM cues）即连同
+    绑定的字幕一起消失，这里再清画面、推进跨场递增的画面序号，使观众
+    屏轮询能立刻看到清屏（旧帧不会因新场还未发出而残留）。
+    """
+    cueflow.clear_screen(conn)
+
+
 def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
     meta = conn.execute(
         "SELECT version, status, paused, control_enabled, control_token, "
         "verify_enabled, verify_round, auto_enabled, auto_interval, "
-        "auto_deadline, auto_remaining FROM meta WHERE id = 1"
+        "auto_deadline, auto_remaining, screen_text, screen_seq "
+        "FROM meta WHERE id = 1"
     ).fetchone()
     rows = conn.execute(
         "SELECT * FROM cues ORDER BY position ASC, id ASC"
@@ -500,7 +543,16 @@ def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
     )
 
     def pending_json(r):
-        return {"id": r["id"], "number": r["number"], "content": r["content"]}
+        return {
+            "id": r["id"],
+            "number": r["number"],
+            "content": r["content"],
+            # 绑定该提示的观众字幕设置（未设置为 None）与当前有效性：
+            # 手工编辑 / 接受提议改写该提示后即使同文也失效；重排不影响。
+            "subtitle": r["subtitle"],
+            "subtitle_valid": bool(r["subtitle_valid"])
+            if r["subtitle"] is not None else False,
+        }
 
     def issued_json(r):
         return {
@@ -534,6 +586,9 @@ def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
         "verify": verify,
         # 自动发出：开关、间隔、剩余秒数或等待就绪；关闭时为固定关闭视图
         "auto": auto_view(meta, verify["all_ready"]),
+        # 观众字幕屏当前画面：subtitle 为上屏字幕（清屏为 null），seq 为
+        # 跨场递增、从不归零的画面序号（观众屏据此丢弃迟到的旧响应）。
+        "screen": {"subtitle": meta["screen_text"], "seq": meta["screen_seq"]},
         "total": len(rows),
         "remaining": len(pending),
         "min_cues": MIN_CUES,
@@ -840,6 +895,14 @@ class SuggestionIn(BaseModel):
 
 class SuggestionDecisionIn(BaseModel):
     version: int    # 控制席审核时携带的最新版本号
+
+
+class SubtitleIn(BaseModel):
+    version: int               # 执行台所见版本号
+    cue_id: int                # 目标待发提示 id（字幕绑定提示身份）
+    # 用 Any 而非 str：非字符串（数字 / 数组 / 对象）不交给 pydantic 422，
+    # 统一由业务校验返回 400；显式 null（Python None）表示清除字幕设置。
+    subtitle: Optional[Any]    # 字幕文本（去空白 1～200 字符）；null 清除设置
 
 
 def auto_interval_error(interval: object) -> Optional[str]:
@@ -1244,6 +1307,64 @@ def reject_suggestion(
         return build_state(conn, x_control_token)
 
 
+# ---------------------------------------------------------------- 观众字幕
+
+@app.post("/api/subtitles")
+def set_subtitle(body: SubtitleIn, x_control_token: Optional[str] = Header(default=None)):
+    """为演出中的待发提示设置 / 清除观众字幕（执行台操作）。
+
+    携带页面版本号、受单控制席保护（与编辑 / 重排等一致）；请求体
+    ``subtitle`` 为字符串时去除首尾空白后须为 1～200 字符，为 ``null``
+    时清除该提示的字幕设置。字幕**绑定提示 id**，与版本号 +1 在同一事务
+    落库，新设置标记为有效：手工编辑或接受提议改写该提示（即使同文）会
+    令其失效，重排不影响。本操作**不推进提示、不换核验轮次、不重新计时、
+    不改变观众当前画面**（画面只随实际发出 / 撤回 / 收场变化）。
+
+    非字符串 / 空白 / 超长返回 400（先于版本检查，不改数据）；非演出中
+    （开场前 / 已完成）、目标不存在或非待发、版本过期返回 409 及最新
+    状态，原有设置与有效性不变；凭据缺失 / 失效返回 403。
+    """
+    with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
+        try:
+            cueflow.set_pending_subtitle(
+                conn,
+                version=body.version,
+                cue_id=body.cue_id,
+                subtitle=body.subtitle,
+            )
+        except cueflow.Conflict as exc:
+            return conflict(conn, x_control_token, exc.message)
+        except cueflow.BadRequest as exc:
+            return bad_request(exc.message)
+        return build_state(conn, x_control_token)
+
+
+@app.get("/api/screen")
+def get_screen():
+    """观众字幕屏专用只读接口：只返回当前字幕与跨场递增的画面序号。
+
+    无需凭据、不需要版本号，不返回提示正文、编号、进度、控制席等任何
+    后台信息（字幕屏可能投影给观众，必须与执行台状态隔离）。``subtitle``
+    为当前应显示的字幕（清屏时为 ``null``）；``seq`` **跨场单调递增、
+    从不归零**，每次画面变化（有效字幕上屏 / 清屏）都 +1，观众屏轮询时
+    只接受更大的序号，迟到的旧响应不能让画面倒退。
+    """
+    with db() as conn:
+        meta = conn.execute(
+            "SELECT screen_text, screen_seq FROM meta WHERE id = 1"
+        ).fetchone()
+        return {"subtitle": meta["screen_text"], "seq": meta["screen_seq"]}
+
+
+@app.get("/screen")
+def screen_page():
+    """观众字幕屏独立页面（/screen）：只显示另行设置的字幕，无后台信息。"""
+    return FileResponse(os.path.join(BASE_DIR, "static", "screen.html"))
+
+
 @app.post("/api/setup")
 def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
     """开场前录入：2~12 条、编号唯一、内容非空。会清空旧进度。"""
@@ -1261,6 +1382,9 @@ def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 手工录入新场：清空上场遗留的问题记录
         clear_suggestions(conn)  # 开新场清空上场的改写提议（提议不跨场）
+        # 开新场清屏并清除字幕设置（随 DELETE FROM cues 一起消失），
+        # 画面序号 +1（跨场不归零），字幕不进档案。
+        clear_subtitles_and_screen(conn)
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "
@@ -1483,6 +1607,7 @@ def reset(x_control_token: Optional[str] = Header(default=None)):
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 重置一并清空当前场问题记录
         clear_suggestions(conn)  # 重置清空当前场改写提议
+        clear_subtitles_and_screen(conn)  # 重置清屏并清除字幕设置（不进档案）
         verify_close(conn)  # 重置关闭本场核验并清空轮次与就绪，下一场不继承
         auto_disable(conn)  # 重置关闭自动模式并清空计时（间隔保留）
         conn.execute(
@@ -1533,6 +1658,7 @@ def archive(body: ArchiveIn, x_control_token: Optional[str] = Header(default=Non
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 已随档案保存，当前场记录清空
         clear_suggestions(conn)  # 改写提议不写入档案，归档时一并清空
+        clear_subtitles_and_screen(conn)  # 字幕设置与画面不写入档案：清屏并清除设置
         # 归档关闭本场核验并清空轮次与就绪（不写入档案，档案结构不变），
         # 下一场不继承；与"写档案 + 清空"在同一事务内提交。
         verify_close(conn)
@@ -1586,6 +1712,7 @@ def start_from_archive(
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 以档案开新场不复制问题记录，原档案不变
         clear_suggestions(conn)  # 以档案开新场不复制改写提议，原档案不变
+        clear_subtitles_and_screen(conn)  # 以档案开新场不复制字幕：清屏并清除设置
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "

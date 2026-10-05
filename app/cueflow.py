@@ -37,6 +37,10 @@ Clock = Callable[[], float]
 # 对当前轮次回报就绪。
 VERIFY_DEPARTMENTS = ("lighting", "sound")
 
+# 观众字幕：去除首尾空白后的合法长度（按字符计）；null 表示清除设置。
+SUBTITLE_MIN_LEN = 1
+SUBTITLE_MAX_LEN = 200
+
 
 class CueflowError(Exception):
     """提示变更业务异常基类：消息即返回给页面的中文说明。"""
@@ -161,6 +165,25 @@ def disable_auto(conn: sqlite3.Connection) -> None:
     )
 
 
+# ---------------------------------------------------------------- 观众字幕画面
+
+def clear_screen(conn: sqlite3.Connection) -> None:
+    """清空观众字幕画面；画面当前非空时才令画面序号 +1。
+
+    撤回末条、归档、重置、手工录入新场、以档案开新场都调用本函数：与触发
+    它的业务写入同一事务，任一失败整体回滚。画面序号**跨场单调递增、从不
+    归零**，观众屏轮询据此只接受更新的序号，迟到的旧响应（含清屏前最后一
+    帧字幕）无法把画面倒退回去。画面本就为空白时（如末条发出的是失效字幕、
+    撤回时已清屏，或连续收场）没有新的画面帧，序号不重复推进——序号标识
+    "更新的画面内容"而非操作次数；只要画面上还显示着旧字幕，任何清屏路径
+    都会推进序号，保证观众屏一定能看到清屏。
+    """
+    conn.execute(
+        "UPDATE meta SET screen_text = NULL, screen_seq = screen_seq + 1 "
+        "WHERE id = 1 AND screen_text IS NOT NULL"
+    )
+
+
 # ---------------------------------------------------------------- 共用发出
 
 def issue_current(conn: sqlite3.Connection, clock: Clock) -> sqlite3.Row:
@@ -172,13 +195,16 @@ def issue_current(conn: sqlite3.Connection, clock: Clock) -> sqlite3.Row:
 
     - 该条以 ``issued_content = content`` 保存**发出那一刻的内容快照**，
       记录服务端发出时间，``issued_seq`` 取推进后的新版本号；
+    - 观众字幕画面与发出**同一事务**更新：该提示绑定的字幕设置仍有效时，
+      画面替换为该字幕（否则清屏），跨场递增的画面序号同时 +1——失败则
+      发出与画面都不变；
     - 全局版本 +1，同时开启核验新轮次并清空本轮就绪；
     - 仍有待发：状态保持演出中，下一条从完整间隔重新自动计时（暂停中
       冻结完整间隔），不补发积压；
     - 末条发出：进入已完成并在同一事务内关闭自动模式、清空计时。
 
-    提示快照、队列状态、版本、核验轮次、计时在同一事务内落库，任一步
-    失败由调用方事务整体回滚。返回被发出的提示行。
+    提示快照、队列状态、版本、核验轮次、计时、字幕画面在同一事务内落库，
+    任一步失败由调用方事务整体回滚。返回被发出的提示行。
     """
     meta = conn.execute("SELECT version FROM meta WHERE id = 1").fetchone()
     row = _first_pending(conn)
@@ -192,6 +218,11 @@ def issue_current(conn: sqlite3.Connection, clock: Clock) -> sqlite3.Row:
         "issued_at = ?, issued_seq = ? WHERE id = ?",
         (now_iso, new_version, row["id"]),
     )
+    # 观众画面：绑定字幕仍有效才上屏，否则清屏（手工 / 自动同一路径，
+    # 画面随发出同事务保存；字幕设置本身不被清除）。
+    screen_text = (
+        row["subtitle"] if row["subtitle_valid"] and row["subtitle"] else None
+    )
     remaining = _pending_count(conn)
     # 与手工 / 自动任一路径一致：推进即开启新轮次并清空本轮就绪（同一事务）
     verify_advance(conn)
@@ -199,15 +230,17 @@ def issue_current(conn: sqlite3.Connection, clock: Clock) -> sqlite3.Row:
         # 全部发出：完成并关闭自动模式（同一事务）
         disable_auto(conn)
         conn.execute(
-            "UPDATE meta SET version = ?, status = 'done' WHERE id = 1",
-            (new_version,),
+            "UPDATE meta SET version = ?, status = 'done', "
+            "screen_text = ?, screen_seq = screen_seq + 1 WHERE id = 1",
+            (new_version, screen_text),
         )
     else:
         # 每次只发一条：下一条从完整间隔重新计时，不补发积压
         restart_timer(conn, clock)
         conn.execute(
-            "UPDATE meta SET version = ?, status = 'live' WHERE id = 1",
-            (new_version,),
+            "UPDATE meta SET version = ?, status = 'live', "
+            "screen_text = ?, screen_seq = screen_seq + 1 WHERE id = 1",
+            (new_version, screen_text),
         )
     return row
 
@@ -328,6 +361,9 @@ def withdraw_last(
     # 与确认同版本竞争时只有一个生效——撤回先完成则确认因版本过期失败，
     # 确认先完成则本撤回因版本过期被拒，双方都不会复用旧轮次。
     verify_advance(conn)
+    # 撤回清屏但保留设置：观众画面清空、画面序号 +1（跨场不归零）；
+    # 被退回提示绑定的字幕设置与有效性原样保留，再次发出时按规则决定上屏。
+    clear_screen(conn)
     # 撤回更换了当前提示：自动计时从完整间隔重新计起（同一事务；
     # 暂停中则冻结完整间隔，恢复后续计）。
     restart_timer(conn, clock)
@@ -353,6 +389,8 @@ def edit_pending(
     版本过期、提示不存在或已发出抛 Conflict；去除首尾空白后内容为空、
     编号为空或编号与其他提示重复抛 BadRequest（数据不变）。``number``
     为 None（请求未提供该字段）时沿用原编号；显式传入字符串则改编号。
+    **手工改写该提示即令其绑定的观众字幕失效（即使新文本与原文相同），
+    字幕设置本身保留**；重排不影响任何字幕设置与有效性。
     **改写的是当前提示（待发队首）时，即使新文本与原文相同也开启新
     核验轮次并从完整间隔重新自动计时**（按提示身份而非文本变化判定）；
     编辑其他待发提示不换轮、不重置计时。所有写入与版本 +1 同一事务。
@@ -383,9 +421,11 @@ def edit_pending(
             raise BadRequest("编号必须唯一")
 
     conn.execute(
-        "UPDATE cues SET content = ?, number = ? WHERE id = ?",
+        "UPDATE cues SET content = ?, number = ?, subtitle_valid = 0 WHERE id = ?",
         (content, new_number, row["id"]),
     )
+    # 手工改写该提示即令其绑定字幕失效：按提示身份判定，即使新文本与原文
+    # 相同也失效（字幕设置本身保留，执行台仍可见并可重新设置）。
     # 改写的是当前提示（待发队首）才开启新轮次并清空就绪；编辑其他待发
     # 提示不影响当前轮次，本轮就绪保留。按提示 id 判定：即使文本相同，
     # 成功改写当前提示也换轮并重计时。
@@ -394,6 +434,49 @@ def edit_pending(
         verify_advance(conn)
         # 改写当前提示：自动计时从完整间隔重新计起（编辑其他提示不重置）
         restart_timer(conn, clock)
+    conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
+
+
+# ---------------------------------------------------------------- 字幕设置
+
+def set_pending_subtitle(
+    conn: sqlite3.Connection, *, version: int, cue_id: int, subtitle: Optional[str]
+) -> None:
+    """为演出中的待发提示设置 / 清除观众字幕（``POST /api/subtitles`` 业务）。
+
+    ``subtitle`` 为 None 表示清除设置；字符串先去除首尾空白，须为
+    1～200 字符（否则 BadRequest，先于任何写入）。字幕**绑定提示 id**：
+    设置与全局版本 +1 同一事务落库，新设置标记为有效。本操作**只改字幕
+    设置**：不推进提示、不换核验轮次、不重新自动计时、不改变暂停状态，
+    也不改变当前观众画面（画面只随实际发出 / 撤回 / 收场变化）。
+
+    非演出中（开场前 / 已完成）、目标不存在或不是待发、版本过期都抛
+    Conflict（HTTP 409，附最新状态），原有设置、有效性与版本不变。
+    """
+    if subtitle is not None:
+        if not isinstance(subtitle, str):
+            raise BadRequest(
+                f"字幕去除首尾空白后需为 {SUBTITLE_MIN_LEN}～{SUBTITLE_MAX_LEN} 字符"
+            )
+        subtitle = subtitle.strip()
+        if not (SUBTITLE_MIN_LEN <= len(subtitle) <= SUBTITLE_MAX_LEN):
+            raise BadRequest(
+                f"字幕去除首尾空白后需为 {SUBTITLE_MIN_LEN}～{SUBTITLE_MAX_LEN} 字符"
+            )
+    meta = conn.execute("SELECT version, status FROM meta WHERE id = 1").fetchone()
+    if meta["status"] != "live" or version != meta["version"]:
+        # 非演出中（开场前 / 已完成）或版本过期：409 附最新状态，数据不变。
+        raise Conflict()
+    row = conn.execute(
+        "SELECT id, status FROM cues WHERE id = ?", (cue_id,)
+    ).fetchone()
+    if row is None or row["status"] != "pending":
+        # 目标不存在或已不是待发（如刚被手工 / 自动发出、撤回交错）。
+        raise Conflict()
+    conn.execute(
+        "UPDATE cues SET subtitle = ?, subtitle_valid = 1 WHERE id = ?",
+        (subtitle, row["id"]),
+    )
     conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
 
 
@@ -451,9 +534,10 @@ def accept_pending_suggestion(
     成为待发时内容为发出快照，同样按快照比对）才失效——此时抛
     Conflict 且**提议保持待审、数据不变**。提议不存在或已处理同样
     Conflict（不重复处理）。"写入建议内容 + 标记已接受 + 版本 +1"在
-    同一事务提交；接受的是当前提示（待发队首）时，**即使建议文本与
-    原文相同**也重开核验轮次、清空就绪并重新自动计时（与编辑当前提示
-    同规则），接受其他提示不重置。
+    同一事务提交；接受即**改写该提示**，其绑定的观众字幕随之失效
+    （即使建议文本与原文相同；重排不影响字幕）；接受的是当前提示
+    （待发队首）时，**即使建议文本与原文相同**也重开核验轮次、清空
+    就绪并重新自动计时（与编辑当前提示同规则），接受其他提示不重置。
     """
     meta = conn.execute("SELECT version FROM meta WHERE id = 1").fetchone()
     if version != meta["version"]:
@@ -478,7 +562,7 @@ def accept_pending_suggestion(
 
     now_iso = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "UPDATE cues SET content = ? WHERE id = ?",
+        "UPDATE cues SET content = ?, subtitle_valid = 0 WHERE id = ?",
         (sug["content"], row["id"]),
     )
     conn.execute(
