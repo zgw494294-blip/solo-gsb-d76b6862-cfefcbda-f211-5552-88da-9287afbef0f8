@@ -333,6 +333,55 @@ button.small { padding: 3px 10px; font-size: 12px; }
 .suggestion-edit .suggestion-input { flex: 1 1 100%; order: 4; }
 .suggestion-edit .issue-meta { flex: 1 1 100%; order: 5; margin: 2px 0 0; }
 
+/* ---------- 观众字幕 ---------- */
+/* 页头字幕屏入口（新标签页打开 /screen.html） */
+.link-btn {
+  display: inline-block;
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.link-btn:hover { color: var(--text); border-color: var(--accent); }
+
+/* 待发条目下的字幕行：有效为暗金，失效为红色提示 */
+.subtitle-line {
+  flex: 1 1 100%;
+  order: 5;
+  font-size: 12px;
+  color: var(--accent);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.subtitle-line.invalid { color: var(--red); }
+
+/* 已设有效字幕的 💬 按钮高亮提示 */
+button.has-sub { border-color: var(--accent); color: var(--accent); }
+
+.tag.sub-tag {
+  background: rgba(245,185,66,.12);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+/* 待发列表中的字幕设置表单（受控制席保护） */
+.subtitle-edit {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.subtitle-edit .ops { margin-left: auto; }
+.subtitle-edit .subtitle-input { flex: 1 1 100%; order: 3; }
+.subtitle-edit .issue-meta { flex: 1 1 100%; order: 4; margin: 2px 0 0; }
+
 /* ---------- 本场核验 ---------- */
 .verify-setup {
   margin-top: 18px;

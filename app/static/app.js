@@ -6,6 +6,7 @@ let state = null;
 let editingId = null; // 正在编辑的待发提示 id
 let editingIssueId = null; // 正在追加现场问题记录的提示 id（已发或待发）
 let suggestingId = null; // 正在为其填写改写提议的待发提示 id（无控制权也可提交）
+let subtitleEditingId = null; // 正在为其设置观众字幕的待发提示 id
 /* 在途请求计数：交错发出的请求（如工种回报与待发重排同时）各自结束时只
  * 释放自身占用，计数归零才解禁——避免一个请求的收尾把另一个仍在途请求的
  * 占用提前解开（回报尚未结束就被重排的收尾解禁，从而重复提交相同回报）。 */
@@ -154,6 +155,9 @@ function applyState(s) {
   if (suggestingId !== null && !s.pending.some((c) => c.id === suggestingId)) {
     suggestingId = null; // 正在填写改写提议的提示已不在待发列表（如已被确认）
   }
+  if (subtitleEditingId !== null && !s.pending.some((c) => c.id === subtitleEditingId)) {
+    subtitleEditingId = null; // 正在设置字幕的提示已不在待发列表（如已被确认）
+  }
   if (editingIssueId !== null &&
       !s.pending.some((c) => c.id === editingIssueId) &&
       !s.issued.some((c) => c.id === editingIssueId)) {
@@ -193,6 +197,8 @@ function updateBusy() {
   // 改写提议的提交 / 接受 / 拒绝按钮：随在途请求同步（防重复处理）；
   // 接受 / 拒绝另需本页有控制资格，提交提议在只读页也允许
   updateSuggestionButtons();
+  // 观众字幕的保存 / 清除按钮：随在途请求与控制资格同步（受控制席保护）
+  updateSubtitleButtons();
 }
 
 /* 页头控制席标记：未启用 / 本页控制 / 他人控制（本页只读，可接管）。 */
@@ -1026,7 +1032,7 @@ function render() {
 function renderPending() {
   const ul = $("#pending-list");
   const items = state.pending;
-  const writable = canWrite(); // 非控制席：改写 / 记问题 / 重排按钮全部禁用
+  const writable = canWrite(); // 非控制席：改写 / 记问题 / 字幕 / 重排按钮全部禁用
   if (!items.length) {
     ul.innerHTML = `<li class="empty">全部提示已发出</li>`;
     return;
@@ -1037,6 +1043,9 @@ function renderPending() {
     }
     if (c.id === suggestingId) {
       return suggestionEditHtml(c);
+    }
+    if (c.id === subtitleEditingId) {
+      return subtitleEditHtml(c);
     }
     if (c.id === editingId) {
       return `<li class="pending-item editing" data-id="${c.id}">
@@ -1050,6 +1059,13 @@ function renderPending() {
     }
     const tag = i === 0 ? `<span class="tag now">当前</span>`
               : i === 1 ? `<span class="tag next">下一条</span>` : "";
+    const sub = subtitleFor(c.id);
+    // 字幕设置及有效性：有效字幕随发出上屏；失效（提示被改写）需重新保存
+    const subLine = sub
+      ? sub.valid
+        ? `<div class="subtitle-line" title="发出该提示时观众字幕屏显示的字幕">💬 字幕：${escapeHtml(sub.text)}</div>`
+        : `<div class="subtitle-line invalid" title="提示被改写后字幕已失效：发出时不会上屏，重新保存即恢复">💬 字幕已失效（提示已改写）：${escapeHtml(sub.text)}</div>`
+      : "";
     return `<li class="pending-item ${i === 0 ? "is-current" : ""}" data-id="${c.id}">
       <span class="badge">${escapeHtml(c.number)}</span>
       <span class="content">${escapeHtml(c.content)}</span>
@@ -1059,9 +1075,12 @@ function renderPending() {
         <button data-action="add-issue" data-id="${c.id}" title="记现场问题" ${writable ? "" : "disabled"}>⚠</button>
         <button data-action="add-suggestion" data-id="${c.id}"
           title="提交改写提议（无控制权也可提交，控制席审核后才改提示）">💡</button>
+        <button class="${sub && sub.valid ? "has-sub" : ""}" data-action="add-subtitle" data-id="${c.id}"
+          title="设置观众字幕（字幕屏只显示字幕，不显示提示正文）" ${writable ? "" : "disabled"}>💬</button>
         <button data-action="up" data-idx="${i}" ${i === 0 || !writable ? "disabled" : ""} title="上移">↑</button>
         <button data-action="down" data-idx="${i}" ${i === items.length - 1 || !writable ? "disabled" : ""} title="下移">↓</button>
       </span>
+      ${subLine}
     </li>`;
   }).join("");
 }
@@ -1249,6 +1268,76 @@ function decideSuggestion(id, accept) {
   });
 }
 
+/* ---------------------------------------------------------------- 观众字幕
+ * 执行台为演出中待发提示设置字幕：POST /api/subtitles 提交 cue_id、字幕正文
+ * （去空白后 1～200 字；text 为 null 清除）与页面所见版本号，受控制席保护，
+ * 成功版本 +1；设置不推进提示、不换核验轮次、不重置自动计时。字幕绑定提示
+ * id：该提示被改写（编辑 / 接受提议，即使同文）后字幕失效——失效设置仍在
+ * 列表中可见，重新保存即恢复；重排不影响。发出该提示时有效字幕替换观众
+ * 画面，否则清屏；撤回清屏但保留设置；归档 / 重置 / 开新场清屏并清除设置。
+ * 观众打开独立字幕屏 /screen.html，只显示字幕，不显示后台提示正文。 */
+
+/* 某条待发提示的字幕设置（无设置返回 null）。 */
+function subtitleFor(cueId) {
+  const subs = (state && state.subtitles) || [];
+  return subs.find((s) => s.cue_id === cueId) || null;
+}
+
+/* 为一条待发提示设置观众字幕的内联表单（受控制席保护，只读页禁用保存）。 */
+function subtitleEditHtml(c) {
+  const sub = subtitleFor(c.id);
+  const writable = canWrite();
+  return `<li class="subtitle-edit" data-id="${c.id}">
+    <span class="badge">${escapeHtml(c.number)}</span>
+    <span class="tag sub-tag">观众字幕</span>
+    <span class="ops">
+      <button class="primary" data-action="save-subtitle" data-id="${c.id}" ${writable ? "" : "disabled"}>保存字幕</button>
+      ${sub ? `<button data-action="clear-subtitle" data-id="${c.id}" ${writable ? "" : "disabled"}>清除</button>` : ""}
+      <button data-action="cancel-subtitle">取消</button>
+    </span>
+    <textarea class="subtitle-input" rows="2" maxlength="200"
+      placeholder="字幕屏显示的字幕（去除首尾空白后 1～200 字）" aria-label="观众字幕">${sub ? escapeHtml(sub.text) : ""}</textarea>
+    <p class="hint-inline issue-meta">字幕随版本 v${state.version} 保存；发出该提示时字幕替换观众画面，无有效字幕则清屏。${sub && !sub.valid ? "<b>当前设置已失效（提示被改写），重新保存即恢复。</b>" : ""}</p>
+  </li>`;
+}
+
+/* 保存 / 清除按钮的可用性：请求在途或非控制席禁用（服务端同样拒绝）。 */
+function updateSubtitleButtons() {
+  if (!state || state.status === "setup") return;
+  const writable = canWrite();
+  $$('button[data-action="save-subtitle"]').forEach((btn) => {
+    btn.disabled = busy || !writable;
+  });
+  $$('button[data-action="clear-subtitle"]').forEach((btn) => {
+    btn.disabled = busy || !writable;
+  });
+}
+
+/* 保存字幕：去除首尾空白后 1～200 字（服务端同样校验，400 时表单保留）。 */
+async function saveSubtitle(id) {
+  const li = $(`.subtitle-edit[data-id="${id}"]`);
+  const input = li ? $(".subtitle-input", li) : null;
+  const text = input ? input.value.trim() : "";
+  if (!text) { toast("字幕内容不能为空"); if (input) input.focus(); return; }
+  if (text.length > 200) { toast("字幕内容不能超过 200 字符"); if (input) input.focus(); return; }
+  const data = await api("/api/subtitles", { version: state.version, cue_id: id, text });
+  if (data) {
+    subtitleEditingId = null;
+    render();
+    toast("字幕已保存：发出该提示时上屏");
+  }
+}
+
+/* 清除该提示的字幕设置（text 为 null）；清除后发出该提示时观众画面清屏。 */
+async function clearSubtitle(id) {
+  const data = await api("/api/subtitles", { version: state.version, cue_id: id, text: null });
+  if (data) {
+    subtitleEditingId = null;
+    render();
+    toast("已清除该提示的字幕设置");
+  }
+}
+
 function renderIssues() {
   const ul = $("#issues-list");
   const count = $("#issues-count");
@@ -1322,6 +1411,7 @@ document.addEventListener("click", (e) => {
     editingId = Number(btn.dataset.id);
     editingIssueId = null;
     suggestingId = null;
+    subtitleEditingId = null;
     render();
   } else if (action === "cancel-edit") {
     editingId = null;
@@ -1347,6 +1437,7 @@ document.addEventListener("click", (e) => {
     editingIssueId = editingIssueId === id ? null : id;
     editingId = null;
     suggestingId = null;
+    subtitleEditingId = null;
     render();
   } else if (action === "cancel-issue") {
     editingIssueId = null;
@@ -1359,6 +1450,7 @@ document.addEventListener("click", (e) => {
     suggestingId = suggestingId === id ? null : id;
     editingId = null;
     editingIssueId = null;
+    subtitleEditingId = null;
     render();
   } else if (action === "cancel-suggestion") {
     suggestingId = null;
@@ -1366,6 +1458,23 @@ document.addEventListener("click", (e) => {
   } else if (action === "save-suggestion") {
     if (busy) return; // 请求在途防重复提交
     saveSuggestion(Number(btn.dataset.id));
+  } else if (action === "add-subtitle") {
+    // 设置观众字幕（受控制席保护）：同刻只开一个字幕表单
+    const id = Number(btn.dataset.id);
+    subtitleEditingId = subtitleEditingId === id ? null : id;
+    editingId = null;
+    editingIssueId = null;
+    suggestingId = null;
+    render();
+  } else if (action === "cancel-subtitle") {
+    subtitleEditingId = null;
+    render();
+  } else if (action === "save-subtitle") {
+    if (busy) return; // 请求在途防重复提交
+    saveSubtitle(Number(btn.dataset.id));
+  } else if (action === "clear-subtitle") {
+    if (busy) return; // 请求在途防重复提交
+    clearSubtitle(Number(btn.dataset.id));
   } else if (action === "accept-suggestion" || action === "reject-suggestion") {
     if (!canWrite()) {
       toast("本页面不是当前控制席：可凭最新版本号接管后再审核");
